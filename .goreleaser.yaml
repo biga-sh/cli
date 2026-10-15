@@ -1,0 +1,171 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+#
+# Release pipeline, run by .github/workflows/release.yml when a v* tag is
+# pushed. What a release ships:
+#
+#   - archives for Linux, macOS (one universal binary), Windows, and FreeBSD
+#   - .deb, .rpm, .apk, and Arch packages
+#   - an SBOM for every archive
+#   - checksums.txt, signed keylessly with Sigstore cosign, plus GitHub
+#     build-provenance attestations (made by the workflow)
+#   - optionally: notarized macOS binaries, when the Apple secrets are set
+#
+# Everything is published to the GitHub release; install.sh and install.ps1
+# download from there.
+#
+# Try it locally with: goreleaser release --snapshot --clean --skip=sign
+version: 2
+
+project_name: biga
+
+metadata:
+  # Reproducible builds: file times come from the tagged commit, not the clock.
+  mod_timestamp: "{{ .CommitTimestamp }}"
+
+builds:
+  - id: biga
+    main: ./cmd/biga
+    binary: biga
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin, windows, freebsd]
+    goarch: [amd64, arm64, arm]
+    goarm: ["7"]
+    ignore:
+      - goos: darwin
+        goarch: arm
+      - goos: windows
+        goarch: arm
+      - goos: freebsd
+        goarch: arm
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/biga-sh/cli/internal/version.version={{ .Version }}
+      # Bake in the hosted server so users need no BIGA_API_URL:
+      # - -X github.com/biga-sh/cli/internal/config.DefaultAPIURL=https://your-host
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+# One macOS binary for both Apple silicon and Intel.
+universal_binaries:
+  - replace: true
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+# Signs and notarizes the macOS binary so Gatekeeper runs it without a
+# warning. Runs only when the Apple secrets are configured (see README).
+notarize:
+  macos:
+    - enabled: '{{ isEnvSet "MACOS_SIGN_P12" }}'
+      sign:
+        certificate: "{{ .Env.MACOS_SIGN_P12 }}"
+        password: "{{ .Env.MACOS_SIGN_PASSWORD }}"
+      notarize:
+        issuer_id: "{{ .Env.MACOS_NOTARY_ISSUER_ID }}"
+        key_id: "{{ .Env.MACOS_NOTARY_KEY_ID }}"
+        key: "{{ .Env.MACOS_NOTARY_KEY }}"
+        wait: true
+        timeout: 20m
+
+archives:
+  - id: biga
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_
+      {{- if eq .Arch "all" }}universal{{ else }}{{ .Arch }}{{ end }}
+      {{- with .Arm }}v{{ . }}{{ end }}
+    # Fixed file times keep archives byte-for-byte reproducible.
+    builds_info:
+      mtime: "{{ .CommitDate }}"
+    files:
+      - src: LICENSE
+        info:
+          mtime: "{{ .CommitDate }}"
+      - src: README.md
+        info:
+          mtime: "{{ .CommitDate }}"
+
+nfpms:
+  - id: packages
+    package_name: biga
+    file_name_template: "{{ .ConventionalFileName }}"
+    vendor: biga
+    maintainer: biga maintainers
+    description: Broadcast a local directory so others can watch it live.
+    homepage: https://github.com/biga-sh/cli
+    license: MIT
+    formats: [deb, rpm, apk, archlinux]
+    bindir: /usr/bin
+    mtime: "{{ .CommitDate }}"
+    contents:
+      - src: LICENSE
+        dst: /usr/share/licenses/biga/LICENSE
+        file_info:
+          mtime: "{{ .CommitDate }}"
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+sboms:
+  - artifacts: archive
+
+# Keyless signing: the certificate binds the signature to this repository's
+# release workflow through GitHub's OIDC token. No keys to store or rotate.
+signs:
+  - cmd: cosign
+    signature: "${artifact}.sigstore.json"
+    args:
+      - sign-blob
+      - "--bundle=${signature}"
+      - "${artifact}"
+      - "--yes"
+    artifacts: checksum
+
+release:
+  github:
+    owner: biga-sh
+    name: cli
+  prerelease: auto
+  footer: |
+    ## Verifying this release
+
+    Every file is listed in `checksums.txt`, which is signed with
+    [Sigstore](https://www.sigstore.dev) by this repository's release workflow.
+
+    ```sh
+    cosign verify-blob \
+      --certificate-identity "https://github.com/biga-sh/cli/.github/workflows/release.yml@refs/tags/{{ .Tag }}" \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      --bundle checksums.txt.sigstore.json checksums.txt
+    sha256sum --check --ignore-missing checksums.txt
+    ```
+
+    Each file also has a GitHub build-provenance attestation:
+
+    ```sh
+    gh attestation verify <file> --repo biga-sh/cli
+    ```
+
+changelog:
+  sort: asc
+  use: github
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\(.+\))??!?:.+$'
+      order: 0
+    - title: Fixes
+      regexp: '^.*?fix(\(.+\))??!?:.+$'
+      order: 1
+    - title: Other changes
+      order: 999
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"
+      - Merge pull request

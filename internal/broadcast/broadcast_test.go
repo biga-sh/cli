@@ -1,0 +1,479 @@
+package broadcast
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/biga-sh/cli/internal/api"
+	"github.com/biga-sh/cli/internal/config"
+	"github.com/biga-sh/cli/internal/session"
+)
+
+// fakeServer implements the session API in memory.
+type fakeServer struct {
+	t *testing.T
+
+	mu          sync.Mutex
+	upserts     int
+	ended       bool
+	heartbeats  int
+	snapshots   []snapshotBody
+	checkpoints []api.CheckpointUpload
+	manifest    []api.ManifestEntry
+	// failNext makes the next n checkpoint requests answer with failStatus.
+	failNext   int
+	failStatus int
+}
+
+type snapshotBody struct {
+	SessionID string
+	Tree      treeNode
+}
+
+type treeNode struct {
+	Type, Name, Path, Hash, Content string
+	Size                            int64
+	Binary, Ignored                 bool
+	Children                        []treeNode
+}
+
+func (n treeNode) files() map[string]treeNode {
+	out := map[string]treeNode{}
+	var walk func(treeNode)
+	walk = func(n treeNode) {
+		if n.Type == "file" {
+			out[n.Path] = n
+		}
+		for _, c := range n.Children {
+			walk(c)
+		}
+	}
+	walk(n)
+	return out
+}
+
+func (s *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/sessions/"), "/")
+	action := ""
+	if len(parts) > 1 {
+		action = parts[1]
+	}
+	switch {
+	case r.Method == http.MethodPut && action == "":
+		s.upserts++
+		s.ended = false
+		fmt.Fprintf(w, `{"ok":true,"data":{"id":%q,"title":"t","status":"active","createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z","endedAt":null}}`, parts[0])
+	case r.Method == http.MethodDelete && action == "":
+		s.ended = true
+		w.WriteHeader(http.StatusNoContent)
+	case r.Method == http.MethodPost && action == "heartbeat":
+		s.heartbeats++
+		w.WriteHeader(http.StatusNoContent)
+	case r.Method == http.MethodGet && action == "manifest":
+		json.NewEncoder(w).Encode(map[string]any{"ok": true, "data": api.Manifest{Files: s.manifest}})
+	case r.Method == http.MethodPost && action == "snapshot":
+		var body snapshotBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			s.t.Errorf("decode snapshot: %v", err)
+		}
+		s.snapshots = append(s.snapshots, body)
+		w.WriteHeader(http.StatusAccepted)
+	case r.Method == http.MethodPost && action == "checkpoint":
+		if s.failNext > 0 {
+			s.failNext--
+			w.WriteHeader(s.failStatus)
+			return
+		}
+		var body api.CheckpointUpload
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			s.t.Errorf("decode checkpoint: %v", err)
+		}
+		s.checkpoints = append(s.checkpoints, body)
+		w.WriteHeader(http.StatusAccepted)
+	default:
+		s.t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		http.NotFound(w, r)
+	}
+}
+
+// changes flattens every checkpoint entry received so far into path→type.
+func (s *fakeServer) changes() map[string]api.ChangeType {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[string]api.ChangeType{}
+	for _, c := range s.checkpoints {
+		for _, e := range c.Entries {
+			out[e.Path] = e.ChangeType
+		}
+	}
+	return out
+}
+
+func (s *fakeServer) with(fn func(*fakeServer)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fn(s)
+}
+
+// events records what a broadcast reports.
+type events struct {
+	mu       sync.Mutex
+	synced   []Checkpoint
+	online   []bool
+	progress []string
+}
+
+func (e *events) Info(string)  {}
+func (e *events) Warn(string)  {}
+func (e *events) Error(string) {}
+
+func (e *events) Progress(msg string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.progress = append(e.progress, msg)
+}
+
+func (e *events) Synced(c Checkpoint) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.synced = append(e.synced, c)
+}
+
+func (e *events) Online(v bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.online = append(e.online, v)
+}
+
+func (e *events) onlineChanges() []bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return slices.Clone(e.online)
+}
+
+type harness struct {
+	t      *testing.T
+	root   string
+	server *fakeServer
+	store  *session.Store
+	events *events
+	opts   Options
+}
+
+func newHarness(t *testing.T, files map[string]string) *harness {
+	t.Helper()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rel, content := range files {
+		write(t, root, rel, content)
+	}
+	server := &fakeServer{t: t}
+	srv := httptest.NewServer(server)
+	t.Cleanup(srv.Close)
+
+	store := session.NewStore(t.TempDir())
+	ev := &events{}
+	return &harness{
+		t: t, root: root, server: server, store: store, events: ev,
+		opts: Options{
+			Client:    api.New(srv.URL, api.WithBackoff(func(int) time.Duration { return time.Millisecond })),
+			Store:     store,
+			Events:    ev,
+			APIURL:    srv.URL,
+			RootDir:   root,
+			Timing:    config.Timing{Idle: 20 * time.Millisecond, MaxWait: 200 * time.Millisecond, Stability: 20 * time.Millisecond},
+			Heartbeat: 50 * time.Millisecond,
+		},
+	}
+}
+
+func (h *harness) start() *Broadcast {
+	h.t.Helper()
+	b, err := New(h.opts)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	if _, err := b.Start(h.t.Context()); err != nil {
+		h.t.Fatal(err)
+	}
+	h.t.Cleanup(func() { b.Stop(h.t.Context()) })
+	return b
+}
+
+func write(t *testing.T, root, rel, content string) {
+	t.Helper()
+	abs := filepath.Join(root, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(abs, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func eventually(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestBroadcastStreamsChanges(t *testing.T) {
+	h := newHarness(t, map[string]string{
+		"main.go":        "package main",
+		"lib/a.go":       "package lib",
+		"lib/b.go":       "package lib",
+		"node_modules/x": "ignored",
+	})
+	b := h.start()
+
+	h.server.with(func(s *fakeServer) {
+		if len(s.snapshots) != 1 {
+			t.Fatalf("got %d snapshots, want 1", len(s.snapshots))
+		}
+		files := s.snapshots[0].Tree.files()
+		if _, ok := files["main.go"]; !ok || len(files) != 3 {
+			t.Errorf("snapshot files = %v", slices.Sorted(func(yield func(string) bool) {
+				for k := range files {
+					if !yield(k) {
+						return
+					}
+				}
+			}))
+		}
+	})
+
+	rec, ok, err := h.store.Lookup(h.root)
+	if err != nil || !ok || rec.SessionID != b.SessionID() || !rec.Live(time.Now()) {
+		t.Fatalf("registry record = %+v, %v, %v", rec, ok, err)
+	}
+
+	write(t, h.root, "main.go", "package main // edited")
+	write(t, h.root, "new.go", "package main")
+	write(t, h.root, "node_modules/y", "still ignored")
+	eventually(t, "edit and create", func() bool {
+		c := h.server.changes()
+		return c["main.go"] == api.ChangeModified && c["new.go"] == api.ChangeAdded
+	})
+
+	if err := os.RemoveAll(filepath.Join(h.root, "lib")); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "directory removal", func() bool {
+		c := h.server.changes()
+		return c["lib/a.go"] == api.ChangeDeleted && c["lib/b.go"] == api.ChangeDeleted
+	})
+
+	for path := range h.server.changes() {
+		if strings.HasPrefix(path, "node_modules") {
+			t.Errorf("ignored path %s was synced", path)
+		}
+	}
+	eventually(t, "heartbeats", func() bool {
+		var n int
+		h.server.with(func(s *fakeServer) { n = s.heartbeats })
+		return n > 0
+	})
+
+	h.events.mu.Lock()
+	var reported int
+	for _, c := range h.events.synced {
+		reported += len(c.Changes)
+		if c.Bytes <= 0 {
+			t.Errorf("checkpoint #%d reported %d bytes sent", c.Seq, c.Bytes)
+		}
+	}
+	gotProgress := len(h.events.progress) > 0
+	h.events.mu.Unlock()
+	if reported < 4 || !gotProgress {
+		t.Errorf("events reported %d changes, progress %v", reported, gotProgress)
+	}
+
+	if err := b.Stop(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	h.server.with(func(s *fakeServer) {
+		if !s.ended {
+			t.Error("session was not ended")
+		}
+	})
+	rec, _, _ = h.store.Lookup(h.root)
+	if rec.Live(time.Now()) || rec.CheckpointsSynced == 0 || rec.LastSeenAt.IsZero() {
+		t.Errorf("record after stop = %+v", rec)
+	}
+}
+
+func TestBroadcastSkipsUnchangedSaves(t *testing.T) {
+	h := newHarness(t, map[string]string{"a.txt": "same"})
+	h.start()
+
+	write(t, h.root, "a.txt", "same") // a save that changes nothing
+	write(t, h.root, "b.txt", "marker")
+	eventually(t, "marker", func() bool { return h.server.changes()["b.txt"] != "" })
+	if _, ok := h.server.changes()["a.txt"]; ok {
+		t.Error("an unchanged save produced a checkpoint entry")
+	}
+}
+
+func TestBroadcastRejoinUploadsOnlyDifferences(t *testing.T) {
+	h := newHarness(t, map[string]string{"same.txt": "same", "changed.txt": "new"})
+
+	first := h.start()
+	if err := first.Stop(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	var sameHash string
+	h.server.with(func(s *fakeServer) {
+		sameHash = s.snapshots[0].Tree.files()["same.txt"].Hash
+		s.manifest = []api.ManifestEntry{
+			{Path: "same.txt", Hash: sameHash},
+			{Path: "changed.txt", Hash: strings.Repeat("0", 64)},
+			{Path: "gone.txt", Hash: strings.Repeat("1", 64)},
+		}
+	})
+
+	b, err := New(h.opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !b.Rejoined() || b.SessionID() != first.SessionID() {
+		t.Fatalf("rejoin used session %q, want %q", b.SessionID(), first.SessionID())
+	}
+	res, err := b.Start(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Stop(t.Context()) })
+
+	if res.Sync != SyncedChanges || res.Files != 2 {
+		t.Errorf("Result = %+v, want 2 changed files", res)
+	}
+	want := map[string]api.ChangeType{"changed.txt": api.ChangeModified, "gone.txt": api.ChangeDeleted}
+	if got := h.server.changes(); len(got) != 2 || got["changed.txt"] != want["changed.txt"] || got["gone.txt"] != want["gone.txt"] {
+		t.Errorf("rejoin changes = %v, want %v", got, want)
+	}
+	h.server.with(func(s *fakeServer) {
+		if len(s.snapshots) != 1 {
+			t.Errorf("rejoin uploaded a full snapshot")
+		}
+	})
+}
+
+func TestBroadcastRetriesWhileServerIsDown(t *testing.T) {
+	h := newHarness(t, map[string]string{"a.txt": "v1"})
+	h.start()
+
+	// Enough failures to exhaust one request's retries, forcing a requeue.
+	h.server.with(func(s *fakeServer) { s.failNext, s.failStatus = 6, http.StatusServiceUnavailable })
+	write(t, h.root, "a.txt", "v2")
+	eventually(t, "the edit to sync after the outage", func() bool {
+		return h.server.changes()["a.txt"] == api.ChangeModified
+	})
+	if got := h.events.onlineChanges(); !slices.Equal(got, []bool{false, true}) {
+		t.Errorf("online changes = %v, want [false true]", got)
+	}
+}
+
+func TestBroadcastReloadsIgnoreRules(t *testing.T) {
+	h := newHarness(t, map[string]string{
+		".gitignore":  "secret.txt\n",
+		"secret.txt":  "hidden at first",
+		"draft.md":    "shared at first",
+		"pkg/keep.go": "package pkg",
+	})
+	h.start()
+
+	write(t, h.root, ".gitignore", "draft.md\n")
+	eventually(t, "the new rules to apply", func() bool {
+		c := h.server.changes()
+		return c["draft.md"] == api.ChangeDeleted && c["secret.txt"] == api.ChangeAdded
+	})
+	if _, ok := h.server.changes()["pkg/keep.go"]; ok {
+		t.Error("an unaffected file was re-sent")
+	}
+
+	// A nested ignore file, created mid-session, applies beneath it.
+	write(t, h.root, "pkg/.bigaignore", "keep.go\n")
+	eventually(t, "the nested rules to apply", func() bool {
+		return h.server.changes()["pkg/keep.go"] == api.ChangeDeleted
+	})
+}
+
+func TestBroadcastReactivatesEndedSession(t *testing.T) {
+	h := newHarness(t, map[string]string{"a.txt": "v1"})
+	h.start()
+
+	var before int
+	h.server.with(func(s *fakeServer) {
+		before = s.upserts
+		s.failNext, s.failStatus = 1, http.StatusConflict
+	})
+	write(t, h.root, "a.txt", "v2")
+	eventually(t, "the edit to sync after reactivation", func() bool {
+		return h.server.changes()["a.txt"] == api.ChangeModified
+	})
+	h.server.with(func(s *fakeServer) {
+		if s.upserts <= before {
+			t.Error("the session was not reactivated")
+		}
+	})
+}
+
+func TestBroadcastHonorsStopRequests(t *testing.T) {
+	h := newHarness(t, map[string]string{"a.txt": "v1"})
+	b := h.start()
+	if err := h.store.RequestStop(b.SessionID()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-b.StopRequested():
+	case <-time.After(5 * time.Second):
+		t.Fatal("stop request was not noticed")
+	}
+}
+
+func TestBroadcastRefusesDirectoryInUse(t *testing.T) {
+	h := newHarness(t, nil)
+	if err := h.store.Save(session.Record{
+		SessionID: "other", RootDir: h.root, PID: os.Getppid(), LastSeenAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(h.opts); err == nil || !strings.Contains(err.Error(), "already being broadcast") {
+		t.Fatalf("New = %v, want an already-broadcasting error", err)
+	}
+}
+
+func TestChunkRespectsLimit(t *testing.T) {
+	hash := strings.Repeat("a", 64)
+	entry := func(size int) api.CheckpointEntry {
+		return api.CheckpointEntry{Path: "f", ChangeType: api.ChangeAdded, Hash: &hash, Content: strings.Repeat("x", size)}
+	}
+	entries := []api.CheckpointEntry{entry(400), entry(400), entry(400), entry(2000)}
+	// Each 400-byte entry encodes to roughly 530 bytes.
+	chunks := chunk(entries, 1200)
+	if len(chunks) != 3 {
+		t.Fatalf("got %d chunks, want 3", len(chunks))
+	}
+	if len(chunks[0]) != 2 || len(chunks[1]) != 1 || len(chunks[2]) != 1 {
+		t.Errorf("chunk sizes = %d, %d, %d", len(chunks[0]), len(chunks[1]), len(chunks[2]))
+	}
+}

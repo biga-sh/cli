@@ -1,0 +1,44 @@
+version: "2"
+
+linters:
+  enable:
+    - bodyclose
+    - errorlint
+    - gocritic
+    - misspell
+    - nolintlint
+    - perfsprint
+    - revive
+    - unconvert
+    - unparam
+    - usestdlibvars
+  settings:
+    perfsprint:
+      strconcat: false
+    errcheck:
+      exclude-functions:
+        - (*os.File).Close
+        - (io.ReadCloser).Close
+        - io.WriteString
+        - os.Remove
+        # Fails only for a misspelled flag name, which tests would catch.
+        - (*github.com/spf13/cobra.Command).MarkFlagDirname
+    revive:
+      rules:
+        - name: exported
+          disabled: true # internal packages; doc comments are kept by review
+  exclusions:
+    presets:
+      - std-error-handling
+    rules:
+      - path: _test\.go
+        linters: [errcheck, unparam]
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/biga-sh/cli

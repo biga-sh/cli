@@ -1,0 +1,88 @@
+// Package snapshot reads a broadcast directory into the tree uploaded when a
+// session starts, and diffs it against the server's copy on rejoin.
+package snapshot
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"unicode/utf8"
+)
+
+// MaxFileBytes is the largest file whose content is uploaded. Bigger files
+// appear in the tree as placeholders, so a stray multi-gigabyte binary cannot
+// exhaust memory or produce an unacceptably large upload.
+const MaxFileBytes = 2 << 20
+
+// File is a file's upload-ready content and identity.
+type File struct {
+	Size int64
+	// Hash is the hex SHA-256 the server stores the content under.
+	Hash string
+	// Content is empty for binary and oversize files.
+	Content string
+	// Binary marks files whose bytes are never uploaded.
+	Binary bool
+	// Oversize marks files larger than [MaxFileBytes].
+	Oversize bool
+}
+
+// ReadFile reads and hashes the file at abs; rel is its slash-separated path
+// relative to the broadcast root.
+//
+// Binary files (any NUL byte, git's heuristic) and oversize files are hashed
+// but their bytes are never embedded: the server stores content in text
+// columns that reject NUL bytes.
+func ReadFile(abs, rel string) (File, error) {
+	f, err := os.Open(abs)
+	if err != nil {
+		return File{}, err
+	}
+	defer f.Close()
+
+	// Reading one byte past the limit detects oversize files without trusting
+	// a size from stat that may be stale by the time the read happens.
+	data, err := io.ReadAll(io.LimitReader(f, MaxFileBytes+1))
+	if err != nil {
+		return File{}, err
+	}
+	if len(data) > MaxFileBytes {
+		info, err := f.Stat()
+		if err != nil {
+			return File{}, err
+		}
+		return File{
+			Size: info.Size(),
+			// The content is unknown, so the hash only needs to change when
+			// the size does; keyed by path so it never collides with a blob.
+			Hash:     hashString(fmt.Sprintf("oversize:%d:%s", info.Size(), rel)),
+			Binary:   true,
+			Oversize: true,
+		}, nil
+	}
+
+	if bytes.IndexByte(data, 0) >= 0 {
+		return File{Size: int64(len(data)), Hash: hashBytes(data), Binary: true}, nil
+	}
+
+	content := string(data)
+	if !utf8.ValidString(content) {
+		// JSON can only carry valid UTF-8, so hash exactly what is sent.
+		content = strings.ToValidUTF8(content, "�")
+	}
+	return File{Size: int64(len(data)), Hash: hashString(content), Content: content}, nil
+}
+
+func hashBytes(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+func hashString(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
