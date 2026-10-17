@@ -38,7 +38,7 @@ curl -fsSL https://raw.githubusercontent.com/biga-sh/cli/main/install.sh | sh
 irm https://raw.githubusercontent.com/biga-sh/cli/main/install.ps1 | iex
 ```
 
-Review the installation script before executing it. For supported platforms, alternative installation methods, verification, and troubleshooting, see the [installation documentation](https://website-vw4l.vercel.app/docs).
+Review the installation script before executing it. For supported platforms, alternative installation methods, verification, and troubleshooting, see the [installation documentation](https://website-vw4l.vercel.app/docs/installation).
 
 ### Share a project
 
@@ -59,7 +59,7 @@ biga open
 biga stop
 ```
 
-Check the [CLI documentation](https://website-vw4l.vercel.app/docs) for command options and configuration details.
+Check the [CLI documentation](https://website-vw4l.vercel.app/docs/cli) for command options and configuration details.
 
 ## What you can do
 
