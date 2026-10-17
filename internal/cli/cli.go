@@ -150,7 +150,7 @@ func (a *app) setup() error {
 
 func (a *app) client(baseURL string) *api.Client {
 	ua := fmt.Sprintf("biga-cli/%s (%s/%s)", version.String(), runtime.GOOS, runtime.GOARCH)
-	return api.New(baseURL, api.WithUserAgent(ua))
+	return api.New(baseURL, api.WithUserAgent(ua), api.WithAccessKey(a.cfg.AccessKey))
 }
 
 // notifyUpdate mentions a newer release learned of by an earlier run, and

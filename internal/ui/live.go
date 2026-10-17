@@ -56,8 +56,8 @@ func (l *live) Progress(i int, msg string) {
 	l.send(progressMsg{i, msg}, func() {})
 }
 
-func (l *live) Started(i int, msg string) {
-	l.send(startedMsg{i, msg}, func() { l.plain.Started(i, msg) })
+func (l *live) Started(i int, msg, url string) {
+	l.send(startedMsg{i, msg, url}, func() { l.plain.Started(i, msg, url) })
 }
 
 func (l *live) Failed(i int, msg string) {
@@ -91,8 +91,8 @@ type (
 		msg string
 	}
 	startedMsg struct {
-		i   int
-		msg string
+		i        int
+		msg, url string
 	}
 	failedMsg struct {
 		i   int
@@ -175,6 +175,9 @@ func (m *liveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.projects[msg.i].detail = msg.msg
 	case startedMsg:
 		m.projects[msg.i].status, m.projects[msg.i].detail = running, ""
+		if msg.url != "" {
+			m.projects[msg.i].URL = msg.url
+		}
 		return m, tea.Println(entry(m.sym, green.Render(m.sym.done), msg.msg))
 	case failedMsg:
 		m.projects[msg.i].status, m.projects[msg.i].detail = failed, msg.msg

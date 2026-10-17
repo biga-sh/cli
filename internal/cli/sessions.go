@@ -297,7 +297,7 @@ func (a *app) cleanUp(ctx context.Context, r session.Record) {
 	endCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	// Best effort: the server may be unreachable, or the session long ended.
-	_ = a.client(r.APIURL).EndSession(endCtx, r.SessionID)
+	_ = a.client(r.APIURL).EndSession(endCtx, r.SessionID, r.Token)
 	_ = a.store.ClearStop(r.SessionID)
 	if err := a.store.Remove(r.RootDir); err != nil {
 		a.ui.Warn(fmt.Sprintf("Could not remove %s from the registry: %v", r.Title, err))

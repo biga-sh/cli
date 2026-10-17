@@ -118,6 +118,13 @@ type Broadcast struct {
 	startedAt time.Time
 	rejoined  bool
 
+	// cred guards the session's owner token and server-reported share link,
+	// which a reactivation from the heartbeat loop can replace while uploads
+	// read them.
+	cred      sync.Mutex
+	ownerTok  string
+	shareLink string
+
 	filter  *ignore.Filter
 	watcher *watch.Watcher
 	batcher *watch.Batcher
@@ -167,8 +174,11 @@ func New(opts Options) (*Broadcast, error) {
 	case b.sessionID == "":
 		b.sessionID = session.NewID()
 	}
-	if found && saved.SessionID == b.sessionID && !saved.StartedAt.IsZero() {
-		b.startedAt = saved.StartedAt
+	if found && saved.SessionID == b.sessionID {
+		b.ownerTok, b.shareLink = saved.Token, saved.ShareLink
+		if !saved.StartedAt.IsZero() {
+			b.startedAt = saved.StartedAt
+		}
 	}
 
 	var savedTitle string
@@ -190,7 +200,63 @@ func (b *Broadcast) Title() string { return b.input.Title }
 func (b *Broadcast) RootDir() string { return b.opts.RootDir }
 
 // ShareURL is the link viewers open.
-func (b *Broadcast) ShareURL() string { return session.ShareURL(b.opts.APIURL, b.sessionID) }
+func (b *Broadcast) ShareURL() string {
+	b.cred.Lock()
+	defer b.cred.Unlock()
+	if b.shareLink != "" {
+		return b.shareLink
+	}
+	return session.ShareURL(b.opts.APIURL, b.sessionID)
+}
+
+// token is the session's owner token.
+func (b *Broadcast) token() string {
+	b.cred.Lock()
+	defer b.cred.Unlock()
+	return b.ownerTok
+}
+
+// adopt records what the server said about the session: a token when it
+// just created it, and the share link when it knows its public address.
+func (b *Broadcast) adopt(s *api.Session) (newToken bool) {
+	b.cred.Lock()
+	defer b.cred.Unlock()
+	if s.Token != "" && s.Token != b.ownerTok {
+		b.ownerTok, newToken = s.Token, true
+	}
+	if s.ShareURL != "" {
+		b.shareLink = s.ShareURL
+	}
+	return newToken
+}
+
+// ensureSession creates or reactivates the session. A rejoin the server
+// refuses because this machine cannot prove it owns the session (the token
+// was lost, or the session predates owner tokens) moves the broadcast to a
+// new session and link rather than failing.
+func (b *Broadcast) ensureSession(ctx context.Context) error {
+	s, err := b.opts.Client.EnsureSession(ctx, b.sessionID, b.token(), b.input)
+	if api.IsOwnershipError(err) && b.rejoined && b.opts.SessionID == "" {
+		old := b.sessionID
+		b.sessionID, b.rejoined, b.startedAt = session.NewID(), false, time.Now()
+		b.cred.Lock()
+		b.ownerTok, b.shareLink = "", ""
+		b.cred.Unlock()
+		b.events.Warn(fmt.Sprintf("The server no longer accepts changes to session %s from this machine, so this broadcast gets a new link.", old))
+		s, err = b.opts.Client.EnsureSession(ctx, b.sessionID, "", b.input)
+	}
+	if api.IsOwnershipError(err) {
+		return fmt.Errorf("session %s belongs to another broadcast; choose a different --session", b.sessionID)
+	}
+	if api.IsAccessKeyError(err) {
+		return fmt.Errorf("%w (set %s to a key from the server's operator)", err, config.EnvAccessKey)
+	}
+	if err != nil {
+		return err
+	}
+	b.adopt(s)
+	return nil
+}
 
 // Rejoined reports whether the broadcast resumes the directory's previous
 // session rather than starting a new one.
@@ -203,7 +269,7 @@ func (b *Broadcast) StopRequested() <-chan struct{} { return b.stopRequested }
 // Start uploads the directory and begins streaming changes.
 func (b *Broadcast) Start(ctx context.Context) (res Result, err error) {
 	b.events.Progress("Connecting…")
-	if _, err := b.opts.Client.EnsureSession(ctx, b.sessionID, b.input); err != nil {
+	if err := b.ensureSession(ctx); err != nil {
 		return Result{}, err
 	}
 	defer func() {
@@ -266,7 +332,7 @@ func (b *Broadcast) upload(ctx context.Context, tree *api.FileNode) (Result, err
 	}
 
 	b.events.Progress("Comparing with the server…")
-	manifest, err := b.opts.Client.Manifest(ctx, b.sessionID)
+	manifest, err := b.opts.Client.Manifest(ctx, b.sessionID, b.token())
 	if errors.Is(err, api.ErrManifestUnavailable) {
 		return b.uploadSnapshot(ctx, tree)
 	}
@@ -289,7 +355,7 @@ func (b *Broadcast) uploadSnapshot(ctx context.Context, tree *api.FileNode) (Res
 	snap := &api.FileSnapshot{SessionID: b.sessionID, Tree: tree, Timestamp: time.Now().UnixMilli()}
 	files := len(snapshot.Hashes(tree))
 	var last time.Time
-	sent, err := b.opts.Client.UploadSnapshot(ctx, snap, func(done, total int) {
+	sent, err := b.opts.Client.UploadSnapshot(ctx, b.token(), snap, func(done, total int) {
 		// Throttled: the body is read in small chunks.
 		if now := time.Now(); now.Sub(last) > 100*time.Millisecond || done == total {
 			last = now
@@ -313,7 +379,7 @@ func (b *Broadcast) abort() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = b.opts.Client.EndSession(ctx, b.sessionID)
+	_ = b.opts.Client.EndSession(ctx, b.sessionID, b.token())
 }
 
 // Stop ends the broadcast: it flushes edits saved just before shutdown, ends
@@ -341,7 +407,7 @@ func (b *Broadcast) shutdown(ctx context.Context) error {
 	if err := b.persist(false); err != nil {
 		b.events.Warn(fmt.Sprintf("Could not update the local session record: %v", err))
 	}
-	err := b.opts.Client.EndSession(ctx, b.sessionID)
+	err := b.opts.Client.EndSession(ctx, b.sessionID, b.token())
 	if api.HasStatus(err, http.StatusNotFound, http.StatusConflict) {
 		return nil // already ended
 	}
@@ -354,6 +420,9 @@ func (b *Broadcast) Checkpoints() int64 { return b.checkpoints.Load() }
 // persist writes the session's local record. A live record carries this
 // process's PID, which `biga status` and `biga stop` use to find it.
 func (b *Broadcast) persist(live bool) error {
+	b.cred.Lock()
+	token, link := b.ownerTok, b.shareLink
+	b.cred.Unlock()
 	rec := session.Record{
 		SessionID:         b.sessionID,
 		Title:             b.input.Title,
@@ -362,6 +431,8 @@ func (b *Broadcast) persist(live bool) error {
 		APIURL:            b.opts.APIURL,
 		CheckpointsSynced: b.checkpoints.Load(),
 		LastSeenAt:        time.Now(),
+		Token:             token,
+		ShareLink:         link,
 	}
 	if live {
 		rec.PID = os.Getpid()
@@ -394,7 +465,7 @@ func (b *Broadcast) heartbeat(ctx context.Context) {
 		if time.Since(time.Unix(0, b.lastContact.Load())) < b.opts.Heartbeat {
 			continue
 		}
-		err := b.opts.Client.Heartbeat(ctx, b.sessionID)
+		err := b.opts.Client.Heartbeat(ctx, b.sessionID, b.token())
 		if api.HasStatus(err, http.StatusNotFound, http.StatusConflict) {
 			// The session ended or expired while we were away, e.g. while
 			// the machine slept. Reactivating keeps the same share URL.
@@ -417,9 +488,20 @@ func (b *Broadcast) heartbeat(ctx context.Context) {
 	}
 }
 
+// reactivate brings back a session that ended or expired while this
+// broadcast was away. If the retention sweep deleted it, the server creates
+// it afresh under the same ID with a new token, which is saved at once.
 func (b *Broadcast) reactivate(ctx context.Context) error {
-	_, err := b.opts.Client.EnsureSession(ctx, b.sessionID, b.input)
-	return err
+	s, err := b.opts.Client.EnsureSession(ctx, b.sessionID, b.token(), b.input)
+	if err != nil {
+		return err
+	}
+	if b.adopt(s) {
+		if err := b.persist(true); err != nil {
+			b.events.Warn(fmt.Sprintf("Could not save the new session token: %v", err))
+		}
+	}
+	return nil
 }
 
 func (b *Broadcast) touchContact() { b.lastContact.Store(time.Now().UnixNano()) }

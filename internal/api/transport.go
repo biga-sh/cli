@@ -33,6 +33,8 @@ type request struct {
 	// compress allows a gzip body when the server accepts one.
 	compress bool
 	progress func(sent, total int)
+	// token is the session's owner token, sent as a bearer credential.
+	token string
 }
 
 // body is an encoded request body.
@@ -63,7 +65,7 @@ func (c *Client) do(ctx context.Context, method, route string, in, out any, opts
 			encoded, allowGzip = true, want
 		}
 
-		data, err := c.attempt(ctx, method, route, b, timeout, opts.progress)
+		data, err := c.attempt(ctx, method, route, b, timeout, opts)
 		if err == nil {
 			return len(b.data), decode(data, out)
 		}
@@ -90,15 +92,15 @@ func (c *Client) do(ctx context.Context, method, route string, in, out any, opts
 	}
 }
 
-func (c *Client) attempt(ctx context.Context, method, route string, b body, timeout time.Duration, progress func(sent, total int)) ([]byte, error) {
+func (c *Client) attempt(ctx context.Context, method, route string, b body, timeout time.Duration, opts request) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	var reader io.Reader
 	if b.data != nil {
 		reader = bytes.NewReader(b.data)
-		if progress != nil {
-			reader = &progressReader{r: bytes.NewReader(b.data), total: len(b.data), fn: progress}
+		if opts.progress != nil {
+			reader = &progressReader{r: bytes.NewReader(b.data), total: len(b.data), fn: opts.progress}
 		}
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+route, reader)
@@ -107,6 +109,12 @@ func (c *Client) attempt(ctx context.Context, method, route string, b body, time
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", c.userAgent)
+	if opts.token != "" {
+		req.Header.Set("Authorization", "Bearer "+opts.token)
+	}
+	if c.accessKey != "" {
+		req.Header.Set("X-Biga-Key", c.accessKey)
+	}
 	if b.data != nil {
 		req.ContentLength = int64(len(b.data))
 		req.Header.Set("Content-Type", "application/json")

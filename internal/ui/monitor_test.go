@@ -31,10 +31,10 @@ func TestFormatChangesCollapsesLongCheckpoints(t *testing.T) {
 func TestPlainMonitor(t *testing.T) {
 	var b strings.Builder
 	u := NewPlain(&b)
-	m := u.Monitor(t.Context(), []Project{{Name: "api", URL: "http://x/session/1", Dir: "/code/api"}})
+	m := u.Monitor(t.Context(), []Project{{Name: "api", URL: "http://x/session/0", Dir: "/code/api"}})
 
-	m.Progress(0, "Uploading") // not shown off a terminal
-	m.Started(0, "Started api")
+	m.Progress(0, "Uploading")                        // not shown off a terminal
+	m.Started(0, "Started api", "http://x/session/1") // the server's link wins
 	m.Live()
 	m.Synced(0, []Change{{Path: "main.go", Kind: Modified}}, 120)
 	m.Online(0, false)
@@ -85,10 +85,10 @@ func TestLiveModelLifecycle(t *testing.T) {
 		t.Errorf("starting view:\n%s", v)
 	}
 
-	if _, cmd := m.Update(startedMsg{0, "Started api"}); cmd == nil {
+	if _, cmd := m.Update(startedMsg{0, "Started api", ""}); cmd == nil {
 		t.Error("a started project should be printed above the panel")
 	}
-	m.Update(startedMsg{1, "Started web"})
+	m.Update(startedMsg{1, "Started web", ""})
 	m.Update(liveMsg{})
 	if v := view(m); !strings.Contains(v, "http://x/session/api") || !strings.Contains(v, "waiting for changes") || !strings.Contains(v, "c copy links") {
 		t.Errorf("live view:\n%s", v)
@@ -124,7 +124,7 @@ func TestLiveModelLifecycle(t *testing.T) {
 func TestLiveModelTruncatesToWidth(t *testing.T) {
 	m := newTestModel(strings.Repeat("long-project-name", 5))
 	m.Update(tea.WindowSizeMsg{Width: 30, Height: 10})
-	m.Update(startedMsg{0, "ok"})
+	m.Update(startedMsg{0, "ok", ""})
 	for _, line := range strings.Split(m.View().Content, "\n") {
 		if w := ansi.StringWidth(line); w > 30 {
 			t.Errorf("line is %d columns wide: %q", w, ansi.Strip(line))

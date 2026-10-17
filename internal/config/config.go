@@ -22,6 +22,7 @@ var DefaultAPIURL = "http://localhost:3000"
 // Environment variables read by [Load].
 const (
 	EnvAPIURL        = "BIGA_API_URL"
+	EnvAccessKey     = "BIGA_ACCESS_KEY"
 	EnvHome          = "BIGA_HOME"
 	EnvIdleMS        = "BIGA_IDLE_MS"
 	EnvMaxWaitMS     = "BIGA_MAX_WAIT_MS"
@@ -47,6 +48,9 @@ type Timing struct {
 type Config struct {
 	// APIURL is the server base URL without a trailing slash.
 	APIURL string
+	// AccessKey is sent to servers that only accept broadcasts from people
+	// holding a key. Empty for open servers.
+	AccessKey string
 	// Home is the directory holding local state, normally ~/.biga.
 	Home   string
 	Timing Timing
@@ -74,8 +78,9 @@ func Load(getenv func(string) string) (Config, error) {
 	}
 
 	return Config{
-		APIURL: apiURL,
-		Home:   home,
+		APIURL:    apiURL,
+		AccessKey: strings.TrimSpace(getenv(EnvAccessKey)),
+		Home:      home,
 		Timing: Timing{
 			Idle:      millis(getenv(EnvIdleMS), 120*time.Millisecond),
 			MaxWait:   millis(getenv(EnvMaxWaitMS), time.Second),

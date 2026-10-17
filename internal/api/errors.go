@@ -86,6 +86,29 @@ func IsPermanent(err error) bool {
 	return ok && se.StatusCode >= 400 && se.StatusCode < 500 && !se.Temporary()
 }
 
+// IsOwnershipError reports whether the server refused a write because this
+// client cannot prove it owns the session: no token, a wrong one, or a
+// session created before owner tokens existed. Retrying cannot fix it; the
+// broadcast needs a session of its own.
+func IsOwnershipError(err error) bool {
+	se, ok := errors.AsType[*StatusError](err)
+	if !ok {
+		return false
+	}
+	switch se.Code {
+	case "unauthorized", "forbidden", "session_locked":
+		return se.StatusCode == http.StatusUnauthorized || se.StatusCode == http.StatusForbidden
+	}
+	return false
+}
+
+// IsAccessKeyError reports whether the server wants an access key this
+// client does not have, or rejected the one it sent.
+func IsAccessKeyError(err error) bool {
+	se, ok := errors.AsType[*StatusError](err)
+	return ok && (se.Code == "access_key_required" || se.Code == "access_key_invalid")
+}
+
 // IsUnreachable reports whether err means the server could not be reached.
 func IsUnreachable(err error) bool {
 	_, ok := errors.AsType[*UnreachableError](err)

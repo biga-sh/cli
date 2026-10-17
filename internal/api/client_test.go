@@ -37,7 +37,7 @@ func TestEnsureSessionUnwrapsEnvelope(t *testing.T) {
 		io.WriteString(w, `{"ok":true,"data":{"id":"abc","title":"demo","status":"active","createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z","endedAt":null}}`)
 	})
 
-	s, err := c.EnsureSession(t.Context(), "abc", CreateSessionInput{Title: "demo"})
+	s, err := c.EnsureSession(t.Context(), "abc", "", CreateSessionInput{Title: "demo"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +50,7 @@ func TestEnsureSessionAcceptsBareResponse(t *testing.T) {
 	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		io.WriteString(w, `{"id":"abc","title":"t","status":"active","createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z","endedAt":null}`)
 	})
-	s, err := c.EnsureSession(t.Context(), "abc", CreateSessionInput{})
+	s, err := c.EnsureSession(t.Context(), "abc", "", CreateSessionInput{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func TestStatusErrorUsesEnvelopeMessage(t *testing.T) {
 		w.WriteHeader(http.StatusConflict)
 		io.WriteString(w, `{"ok":false,"error":{"code":"inactive_session","message":"Session has ended."}}`)
 	})
-	err := c.Heartbeat(t.Context(), "abc")
+	err := c.Heartbeat(t.Context(), "abc", "")
 	se, ok := errors.AsType[*StatusError](err)
 	if !ok {
 		t.Fatalf("err = %v, want *StatusError", err)
@@ -86,7 +86,7 @@ func TestRetriesTransientFailures(t *testing.T) {
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
-	if err := c.EndSession(t.Context(), "abc"); err != nil {
+	if err := c.EndSession(t.Context(), "abc", ""); err != nil {
 		t.Fatal(err)
 	}
 	if got := calls.Load(); got != 3 {
@@ -100,7 +100,7 @@ func TestDoesNotRetryClientErrors(t *testing.T) {
 		calls.Add(1)
 		w.WriteHeader(http.StatusBadRequest)
 	})
-	if err := c.EndSession(t.Context(), "abc"); !HasStatus(err, http.StatusBadRequest) {
+	if err := c.EndSession(t.Context(), "abc", ""); !HasStatus(err, http.StatusBadRequest) {
 		t.Fatalf("err = %v", err)
 	}
 	if got := calls.Load(); got != 1 {
@@ -114,7 +114,7 @@ func TestGivesUpAfterMaxAttempts(t *testing.T) {
 		calls.Add(1)
 		w.WriteHeader(http.StatusTooManyRequests)
 	})
-	if err := c.EndSession(t.Context(), "abc"); !HasStatus(err, http.StatusTooManyRequests) {
+	if err := c.EndSession(t.Context(), "abc", ""); !HasStatus(err, http.StatusTooManyRequests) {
 		t.Fatalf("err = %v", err)
 	}
 	if got := calls.Load(); got != defaultAttempts {
@@ -128,7 +128,7 @@ func TestStopsRetryingWhenContextEnds(t *testing.T) {
 		cancel()
 		w.WriteHeader(http.StatusBadGateway)
 	})
-	if err := c.EndSession(ctx, "abc"); err == nil {
+	if err := c.EndSession(ctx, "abc", ""); err == nil {
 		t.Fatal("expected an error")
 	}
 }
@@ -137,7 +137,7 @@ func TestManifestUnavailableOn404(t *testing.T) {
 	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		http.NotFound(w, nil)
 	})
-	if _, err := c.Manifest(t.Context(), "abc"); !errors.Is(err, ErrManifestUnavailable) {
+	if _, err := c.Manifest(t.Context(), "abc", ""); !errors.Is(err, ErrManifestUnavailable) {
 		t.Fatalf("err = %v, want ErrManifestUnavailable", err)
 	}
 }
@@ -149,7 +149,7 @@ func TestSessionIDIsPathEscaped(t *testing.T) {
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
-	if err := c.Heartbeat(t.Context(), "a/b"); err != nil {
+	if err := c.Heartbeat(t.Context(), "a/b", ""); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -158,7 +158,7 @@ func TestPushCheckpointValidatesLocally(t *testing.T) {
 	c := newTestClient(t, func(http.ResponseWriter, *http.Request) {
 		t.Error("invalid checkpoint reached the server")
 	})
-	_, err := c.PushCheckpoint(t.Context(), &CheckpointUpload{
+	_, err := c.PushCheckpoint(t.Context(), "", &CheckpointUpload{
 		SessionID: "abc",
 		Entries:   []CheckpointEntry{{Path: "../etc/passwd", ChangeType: ChangeDeleted}},
 		Timestamp: 1,
@@ -273,16 +273,16 @@ func TestCompressesOnceServerAdvertisesGzip(t *testing.T) {
 	})
 
 	// Before the server has advertised support, bodies go out plain.
-	if _, err := c.PushCheckpoint(t.Context(), validUpload()); err != nil {
+	if _, err := c.PushCheckpoint(t.Context(), "", validUpload()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.EnsureSession(t.Context(), "abc", CreateSessionInput{}); err != nil {
+	if _, err := c.EnsureSession(t.Context(), "abc", "", CreateSessionInput{}); err != nil {
 		t.Fatal(err)
 	}
 	if !c.Compressing() {
 		t.Fatal("client did not pick up the advertised encoding")
 	}
-	if _, err := c.PushCheckpoint(t.Context(), validUpload()); err != nil {
+	if _, err := c.PushCheckpoint(t.Context(), "", validUpload()); err != nil {
 		t.Fatal(err)
 	}
 	if len(gzipped) != 2 || gzipped[0] || !gzipped[1] {
@@ -301,7 +301,7 @@ func TestFallsBackWhenCompressionIsRejected(t *testing.T) {
 		w.WriteHeader(http.StatusAccepted)
 	})
 	c.gzip.Store(true)
-	if _, err := c.PushCheckpoint(t.Context(), validUpload()); err != nil {
+	if _, err := c.PushCheckpoint(t.Context(), "", validUpload()); err != nil {
 		t.Fatal(err)
 	}
 	if c.Compressing() || calls.Load() != 2 {
@@ -323,7 +323,7 @@ func TestHonorsRetryAfter(t *testing.T) {
 		gap = time.Since(first)
 		w.WriteHeader(http.StatusNoContent)
 	})
-	if err := c.EndSession(t.Context(), "abc"); err != nil {
+	if err := c.EndSession(t.Context(), "abc", ""); err != nil {
 		t.Fatal(err)
 	}
 	if gap < 900*time.Millisecond {
@@ -340,7 +340,7 @@ func TestUnreachableServer(t *testing.T) {
 	ln.Close() // nothing listens here now
 
 	c := New("http://"+addr, WithBackoff(func(int) time.Duration { return time.Millisecond }))
-	err = c.Heartbeat(t.Context(), "abc")
+	err = c.Heartbeat(t.Context(), "abc", "")
 	if !IsUnreachable(err) {
 		t.Fatalf("err = %v, want an UnreachableError", err)
 	}
@@ -363,7 +363,7 @@ func TestUploadSnapshotReportsProgress(t *testing.T) {
 	}, Timestamp: 1}
 
 	var last, total int
-	sent, err := c.UploadSnapshot(t.Context(), snap, func(s, t int) { last, total = s, t })
+	sent, err := c.UploadSnapshot(t.Context(), "", snap, func(s, t int) { last, total = s, t })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -395,7 +395,73 @@ func TestSmallBodiesAreNotCompressed(t *testing.T) {
 	c.gzip.Store(true)
 	small := validUpload()
 	small.Entries[0].Content = "x"
-	if _, err := c.PushCheckpoint(t.Context(), small); err != nil {
+	if _, err := c.PushCheckpoint(t.Context(), "", small); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCredentialsAreSent(t *testing.T) {
+	var auth, key atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth.Store(r.Header.Get("Authorization"))
+		key.Store(r.Header.Get("X-Biga-Key"))
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := New(srv.URL, WithAccessKey("bgk_key"))
+	if err := c.Heartbeat(t.Context(), "abc", "bgs_token"); err != nil {
+		t.Fatal(err)
+	}
+	if auth.Load() != "Bearer bgs_token" || key.Load() != "bgk_key" {
+		t.Errorf("Authorization = %q, X-Biga-Key = %q", auth.Load(), key.Load())
+	}
+
+	if err := New(srv.URL).Heartbeat(t.Context(), "abc", ""); err != nil {
+		t.Fatal(err)
+	}
+	if auth.Load() != "" || key.Load() != "" {
+		t.Errorf("credentials sent without being configured: %q %q", auth.Load(), key.Load())
+	}
+}
+
+func TestEnsureSessionReturnsToken(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		io.WriteString(w, `{"ok":true,"data":{"id":"abc","title":"t","status":"active","createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z","endedAt":null,"token":"bgs_x","shareUrl":"https://biga.example/session/abc"}}`)
+	})
+	s, err := c.EnsureSession(t.Context(), "abc", "", CreateSessionInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Token != "bgs_x" || s.ShareURL != "https://biga.example/session/abc" {
+		t.Errorf("session = %+v", s)
+	}
+}
+
+func TestOwnershipAndAccessKeyErrors(t *testing.T) {
+	for _, tc := range []struct {
+		status         int
+		code           string
+		ownership, key bool
+	}{
+		{http.StatusUnauthorized, "unauthorized", true, false},
+		{http.StatusForbidden, "forbidden", true, false},
+		{http.StatusForbidden, "session_locked", true, false},
+		{http.StatusUnauthorized, "access_key_required", false, true},
+		{http.StatusUnauthorized, "access_key_invalid", false, true},
+		{http.StatusConflict, "invalid_state", false, false},
+	} {
+		c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(tc.status)
+			io.WriteString(w, `{"ok":false,"error":{"code":"`+tc.code+`","message":"m"}}`)
+		})
+		err := c.EndSession(t.Context(), "abc", "bgs_x")
+		if IsOwnershipError(err) != tc.ownership || IsAccessKeyError(err) != tc.key {
+			t.Errorf("%d %s: ownership=%v key=%v", tc.status, tc.code, IsOwnershipError(err), IsAccessKeyError(err))
+		}
+		if !IsPermanent(err) {
+			t.Errorf("%d %s should not be retried", tc.status, tc.code)
+		}
 	}
 }

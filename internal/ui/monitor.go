@@ -49,8 +49,9 @@ type Project struct {
 type Monitor interface {
 	// Progress describes what a starting project is doing.
 	Progress(project int, msg string)
-	// Started marks a project as live, with a one-line summary.
-	Started(project int, msg string)
+	// Started marks a project as live, with a one-line summary and the link
+	// it is shared at, which can differ from the one known before it started.
+	Started(project int, msg, url string)
 	// Failed marks a project as having failed to start.
 	Failed(project int, msg string)
 	// Synced reports a checkpoint the server accepted.
@@ -105,7 +106,12 @@ func (l *lines) prefix(project int) string {
 
 func (l *lines) Progress(int, string) {}
 
-func (l *lines) Started(_ int, msg string) { l.ui.Step(msg) }
+func (l *lines) Started(project int, msg, url string) {
+	if url != "" {
+		l.projects[project].URL = url
+	}
+	l.ui.Step(msg)
+}
 
 func (l *lines) Failed(_ int, msg string) { l.ui.Error(msg) }
 

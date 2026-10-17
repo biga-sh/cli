@@ -181,6 +181,12 @@ type Session struct {
 	UpdatedAt time.Time  `json:"updatedAt"`
 	EndedAt   *time.Time `json:"endedAt"`
 	GroupID   *string    `json:"groupId"`
+	// Token is the session's owner credential. The server returns it only on
+	// the response that created the session and keeps nothing but a hash, so
+	// it must be saved: every later write needs it.
+	Token string `json:"token"`
+	// ShareURL is the viewer link, when the server knows its public address.
+	ShareURL string `json:"shareUrl"`
 }
 
 // ManifestEntry identifies one file the server currently holds for a session.

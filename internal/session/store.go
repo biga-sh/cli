@@ -28,6 +28,12 @@ type Record struct {
 	StartedAt         time.Time `json:"startedAt"`
 	APIURL            string    `json:"apiBaseUrl"`
 	CheckpointsSynced int64     `json:"checkpointsSynced"`
+	// Token is the session's owner token: the only proof this machine may
+	// write to the session. The registry file is readable by its owner only.
+	Token string `json:"token,omitzero"`
+	// ShareLink is the viewer link the server reported, if it knows its
+	// public address.
+	ShareLink string `json:"shareUrl,omitzero"`
 	// PID and LastSeenAt identify the process broadcasting the session. Both
 	// are cleared when the broadcast stops.
 	PID        int       `json:"pid,omitzero"`
@@ -36,6 +42,9 @@ type Record struct {
 
 // ShareURL is the viewer URL for the session.
 func (r Record) ShareURL() string {
+	if r.ShareLink != "" {
+		return r.ShareLink
+	}
 	return ShareURL(r.APIURL, r.SessionID)
 }
 

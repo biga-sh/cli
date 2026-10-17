@@ -182,7 +182,7 @@ func startAll(ctx context.Context, broadcasts []*broadcast.Broadcast, view ui.Mo
 				return err
 			}
 			started[i] = true
-			view.Started(i, describeStart(b, res))
+			view.Started(i, describeStart(b, res), b.ShareURL())
 			return nil
 		})
 	}

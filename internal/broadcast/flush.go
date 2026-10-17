@@ -247,7 +247,7 @@ func (b *Broadcast) sendAll(ctx context.Context, entries []api.CheckpointEntry) 
 
 func (b *Broadcast) push(ctx context.Context, entries []api.CheckpointEntry) (int, error) {
 	upload := &api.CheckpointUpload{SessionID: b.sessionID, Entries: entries, Timestamp: time.Now().UnixMilli()}
-	sent, err := b.opts.Client.PushCheckpoint(ctx, upload)
+	sent, err := b.opts.Client.PushCheckpoint(ctx, b.token(), upload)
 	if !api.HasStatus(err, http.StatusNotFound, http.StatusConflict) {
 		return sent, err
 	}
@@ -257,7 +257,7 @@ func (b *Broadcast) push(ctx context.Context, entries []api.CheckpointEntry) (in
 		return 0, err
 	}
 	b.events.Info(fmt.Sprintf("Session %s was reactivated.", b.sessionID))
-	return b.opts.Client.PushCheckpoint(ctx, upload)
+	return b.opts.Client.PushCheckpoint(ctx, b.token(), upload)
 }
 
 // chunk splits entries into groups whose encoded size stays under limit. An

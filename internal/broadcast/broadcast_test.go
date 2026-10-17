@@ -3,6 +3,7 @@ package broadcast
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -32,6 +33,11 @@ type fakeServer struct {
 	// failNext makes the next n checkpoint requests answer with failStatus.
 	failNext   int
 	failStatus int
+	// tokens holds each session's owner token; an empty token marks a
+	// session created before owner tokens, which refuses every write.
+	tokens map[string]string
+	// authFailures counts writes made without the right token.
+	authFailures int
 }
 
 type snapshotBody struct {
@@ -70,11 +76,42 @@ func (s *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if len(parts) > 1 {
 		action = parts[1]
 	}
+	if s.tokens == nil {
+		s.tokens = map[string]string{}
+	}
+	id := parts[0]
+	token, exists := s.tokens[id]
+	if r.Method == http.MethodPut && action == "" && !exists {
+		token = fmt.Sprintf("bgs_%s_%d", id, len(s.tokens))
+		s.tokens[id] = token
+		s.upserts++
+		s.ended = false
+		w.WriteHeader(http.StatusCreated)
+		fmt.Fprintf(w, `{"ok":true,"data":{"id":%q,"title":"t","status":"active","createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z","endedAt":null,"token":%q}}`, id, token)
+		return
+	}
+	switch got := r.Header.Get("Authorization"); {
+	case exists && token == "":
+		s.authFailures++
+		w.WriteHeader(http.StatusForbidden)
+		io.WriteString(w, `{"ok":false,"error":{"code":"session_locked","message":"locked"}}`)
+		return
+	case got == "":
+		s.authFailures++
+		w.WriteHeader(http.StatusUnauthorized)
+		io.WriteString(w, `{"ok":false,"error":{"code":"unauthorized","message":"token required"}}`)
+		return
+	case got != "Bearer "+token:
+		s.authFailures++
+		w.WriteHeader(http.StatusForbidden)
+		io.WriteString(w, `{"ok":false,"error":{"code":"forbidden","message":"wrong token"}}`)
+		return
+	}
 	switch {
 	case r.Method == http.MethodPut && action == "":
 		s.upserts++
 		s.ended = false
-		fmt.Fprintf(w, `{"ok":true,"data":{"id":%q,"title":"t","status":"active","createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z","endedAt":null}}`, parts[0])
+		fmt.Fprintf(w, `{"ok":true,"data":{"id":%q,"title":"t","status":"active","createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z","endedAt":null}}`, id)
 	case r.Method == http.MethodDelete && action == "":
 		s.ended = true
 		w.WriteHeader(http.StatusNoContent)
@@ -475,5 +512,72 @@ func TestChunkRespectsLimit(t *testing.T) {
 	}
 	if len(chunks[0]) != 2 || len(chunks[1]) != 1 || len(chunks[2]) != 1 {
 		t.Errorf("chunk sizes = %d, %d, %d", len(chunks[0]), len(chunks[1]), len(chunks[2]))
+	}
+}
+
+func TestBroadcastKeepsItsOwnerToken(t *testing.T) {
+	h := newHarness(t, map[string]string{"a.txt": "v1"})
+	b := h.start()
+	write(t, h.root, "a.txt", "v2")
+	eventually(t, "the edit to sync", func() bool { return h.server.changes()["a.txt"] == api.ChangeModified })
+
+	rec, ok, err := h.store.Lookup(h.root)
+	if err != nil || !ok {
+		t.Fatalf("Lookup = %v, %v", ok, err)
+	}
+	var issued string
+	h.server.with(func(s *fakeServer) { issued = s.tokens[b.SessionID()] })
+	if rec.Token == "" || rec.Token != issued {
+		t.Errorf("saved token %q, server issued %q", rec.Token, issued)
+	}
+	if err := b.Stop(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	// The next run rejoins with the saved token.
+	again := h.start()
+	if !again.Rejoined() || again.SessionID() != b.SessionID() {
+		t.Errorf("rejoin used session %q", again.SessionID())
+	}
+	h.server.with(func(s *fakeServer) {
+		if s.authFailures != 0 {
+			t.Errorf("%d writes were refused", s.authFailures)
+		}
+	})
+}
+
+func TestBroadcastMovesOffALockedSession(t *testing.T) {
+	h := newHarness(t, map[string]string{"a.txt": "v1"})
+	// A session from before owner tokens: saved locally, no token anywhere.
+	if err := h.store.Save(session.Record{SessionID: "legacy01", RootDir: h.root, Title: "old"}); err != nil {
+		t.Fatal(err)
+	}
+	h.server.with(func(s *fakeServer) { s.tokens = map[string]string{"legacy01": ""} })
+
+	b := h.start()
+	if b.SessionID() == "legacy01" || b.Rejoined() {
+		t.Fatalf("broadcast stayed on the locked session (%s, rejoined=%v)", b.SessionID(), b.Rejoined())
+	}
+	h.server.with(func(s *fakeServer) {
+		if len(s.snapshots) != 1 || s.snapshots[0].SessionID != b.SessionID() {
+			t.Errorf("snapshots = %+v", s.snapshots)
+		}
+	})
+	rec, _, _ := h.store.Lookup(h.root)
+	if rec.SessionID != b.SessionID() || rec.Token == "" {
+		t.Errorf("registry = %+v", rec)
+	}
+}
+
+func TestBroadcastRefusesSomeoneElsesSession(t *testing.T) {
+	h := newHarness(t, map[string]string{"a.txt": "v1"})
+	h.server.with(func(s *fakeServer) { s.tokens = map[string]string{"taken": "bgs_theirs"} })
+	h.opts.SessionID = "taken"
+	b, err := New(h.opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Start(t.Context()); err == nil || !strings.Contains(err.Error(), "belongs to another broadcast") {
+		t.Fatalf("Start = %v, want an ownership error", err)
 	}
 }
